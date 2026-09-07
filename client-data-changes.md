@@ -517,13 +517,198 @@ input: 'Входной идентификатор',
 
 ---
 
+## 7. Поиск по номеру счёта и номеру карты (accounts.number, cards.number)
+
+Задача: принимать на вход также номер счёта и номер карты, сопоставлять их с
+`accounts.number` и вложенным `accounts[].cards[].number` в `ClientDataResponse`
+(в этом DTO `cards` вложены **внутрь** каждого `accounts[]`, а не отдельным
+полем верхнего уровня).
+
+⚠️ **Важная оговорка**: неизвестен точный формат `Input`, который ожидает
+внешний сервис `clientdata-fl-aml` для поиска по счёту/карте — в
+`client-data-request.dto.ts` сейчас определены только 4 варианта (`mdmId`,
+`id`, ФИО+дата рождения, `serial+number`). Ниже добавлены два новых варианта
+по аналогии с `serial+number`, но если внешний API ожидает другие имена
+полей — поиск не сработает, это нужно проверить на реальном запросе и
+поправить по факту.
+
+### `server/src/services/client-data/dto/client-data-request.dto.ts` (строки 9–33)
+
+Добавить в union `Input` два новых варианта (после блока с `serial`/`number`):
+
+```ts
+| {
+    // Номер счёта
+    accountNumber: string;
+    stateDate?: string; // format "YYYY-MM-DD"
+  }
+| {
+    // Номер карты
+    cardNumber: string;
+    stateDate?: string; // format "YYYY-MM-DD"
+  };
+```
+
+### `server/src/services/client-data/client-data.service.ts`
+
+`generatedInput` (строки 11–56) — добавить перед `return input;` (строка 55):
+
+```ts
+if (clientInput.accountNumber) {
+  input.push({
+    accountNumber: String(clientInput.accountNumber),
+    stateDate,
+  });
+}
+if (clientInput.cardNumber) {
+  input.push({
+    cardNumber: String(clientInput.cardNumber),
+    stateDate,
+  });
+}
+```
+
+`generatePostData` (строка 70) — было:
+
+```ts
+const excludeSources = ['cards', 'factor', 'person'];
+```
+
+Стало:
+
+```ts
+const excludeSources = ['factor', 'person']; // CHANGED: убрали 'cards' — источник карт теперь нужен для поиска
+```
+
+### `server/src/api/types` — тип `RequestData`
+
+Добавить два поля:
+
+```ts
+export type RequestData = {
+  // ...существующие поля (cifId, DwhId, lastName, ...)
+  accountNumber?: string; // NEW
+  cardNumber?: string;    // NEW
+};
+```
+
+### `server/src/api/api.service.ts`
+
+`parseFile` — добавить после блока `if (row.number) { item.number = ... }`:
+
+```ts
+if (row.accountNumber) {
+  item.accountNumber = String(row.accountNumber);
+}
+if (row.cardNumber) {
+  item.cardNumber = String(row.cardNumber);
+}
+```
+
+`getFieldsFromCDIRes`, внутри `for (const input of cdi)` — добавить после
+блока с `actDate`:
+
+```ts
+if (
+  input.accountNumber &&
+  cdr.accounts?.some((acc) => acc.number === input.accountNumber)
+) {
+  result['accountNumber'] = input.accountNumber;
+}
+if (
+  input.cardNumber &&
+  cdr.accounts?.some((acc) =>
+    acc.cards?.some((card) => card.number === input.cardNumber),
+  )
+) {
+  result['cardNumber'] = input.cardNumber;
+}
+```
+
+`findCdrForInput` (добавлен в разделе 3, для режима `matched`) — добавить
+перед `return undefined;`:
+
+```ts
+if (input.accountNumber) {
+  return clientDataRes.find((cdr) =>
+    cdr.accounts?.some((acc) => acc.number === input.accountNumber),
+  );
+}
+if (input.cardNumber) {
+  return clientDataRes.find((cdr) =>
+    cdr.accounts?.some((acc) =>
+      acc.cards?.some((card) => card.number === input.cardNumber),
+    ),
+  );
+}
+```
+
+`formatInputLabel` — добавить в цепочку `||`:
+
+```ts
+private formatInputLabel(input: RequestData): string {
+  return (
+    input.cifId?.join(',') ||
+    input.DwhId?.join(',') ||
+    input.accountNumber || // NEW
+    input.cardNumber ||    // NEW
+    [input.lastName, input.firstName, input.middleName].filter(Boolean).join(' ') ||
+    [input.serial, input.number].filter(Boolean).join('/') ||
+    ''
+  );
+}
+```
+
+### Клиент `App.jsx`
+
+В `formData` (там же, где `cifId`, `DwhId`, ...) добавить:
+
+```jsx
+accountNumber: '',
+cardNumber: '',
+```
+
+— и в обоих местах `setFormData({...})` (сброс формы в `handleSubmit`) тоже
+добавить эти два поля с пустой строкой.
+
+В JSX ручного ввода — рядом с полями `cifId`/`DwhId` добавить два аналогичных
+`<input>`:
+
+```jsx
+<input
+  type="text"
+  name="accountNumber"
+  placeholder="Номер счёта"
+  value={formData.accountNumber}
+  onChange={handleInputChange}
+  disabled={isLoading}
+/>
+<input
+  type="text"
+  name="cardNumber"
+  placeholder="Номер карты"
+  value={formData.cardNumber}
+  onChange={handleInputChange}
+  disabled={isLoading}
+/>
+```
+
+Проверить `handleInputChange` — если там сейчас есть спец-обработка только
+для `cifId`/`DwhId` через `.split(',')`, для `accountNumber`/`cardNumber`
+нужна обычная ветка `else`, как для `lastName` и т.п.
+
+---
+
 ## Файлы, которые трогать не нужно
 
 - `main.jsx`
 - `app.controller.ts` / `app.module.ts` (health-check, не связан с задачей)
-- `client-data.service.ts`, `client-data.module.ts`
+- `client-data.module.ts`
 - `configuration.ts`
 - `services/file/file.controller.ts` и `file.module.ts` — контроллер не
   зарегистрирован в модуле (нет `controllers: [...]` в `file.module.ts`),
   это мёртвый код с дублирующимися путями `uploadFile`/`uploadField`,
   конфликтующими с `api.controller.ts`, если его когда-нибудь подключат.
+
+Примечание: `client-data.service.ts` теперь **тоже меняется** (см. раздел 7)
+— из списка "не трогать" он исключён.
